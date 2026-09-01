@@ -1,55 +1,50 @@
-# Устанавливаем OpenConnect Server и модуль интеграции PAM с RADIUS
+# Гарантируем, что базовый пакет ocserv установлен
 install_ocserv_packages:
   pkg.installed:
-    - names:
-      - ocserv
-      - libpam-radius-auth
+    - name: ocserv
 
-# Настраиваем RADIUS-клиент для PAM, прописывая туда наш секретный ключ из Pillar
-configure_pam_radius_server:
+# Создаем конфигурационный файл RADIUS-клиента для самого ocserv (БЕЗ КОММЕНТАРИЕВ В СТРОКЕ!)
+configure_ocserv_radius_client:
   file.managed:
-    - name: /etc/pam_radius_auth.conf
+    - name: /etc/radcli/radiusclient.conf
+    - makedirs: True
     - contents: |
-        # server[:port] secret [timeout] [hint]
-        127.0.0.1       {{ salt['pillar.get']('secrets:radius_shared_secret') }} 5
+        nas-identifier  ocserv
+        authserver      127.0.0.1:1812
+        acctserver      127.0.0.1:1813
+        servers         /etc/radcli/servers
+        dictionary      /etc/freeradius/3.0/dictionary
+        radius_timeout  5
+        radius_retries  3
+    - require:
+      - pkg: install_ocserv_packages
+
+# Прописываем секретный ключ RADIUS в файл серверов radcli
+configure_ocserv_radius_servers_key:
+  file.managed:
+    - name: /etc/radcli/servers
+    - contents: |
+        127.0.0.1       {{ salt['pillar.get']('secrets:radius_shared_secret') }}
     - mode: '0600'
     - user: root
     - group: root
     - require:
-      - pkg: install_ocserv_packages
-
-# Прописываем этот же секретный ключ в локальный FreeRADIUS, чтобы он принимал запросы от самого себя
-configure_freeradius_local_client:
-  file.managed:
-    - name: /etc/freeradius/3.0/clients.d/localhost.conf
-    - makedirs: True
-    - contents: |
-        client localhost_pam {
-            ipaddr = 127.0.0.1
-            secret = {{ salt['pillar.get']('secrets:radius_shared_secret') }}
-        }
-    - require:
-      - pkg: install_ocserv_packages
-
-# Настраиваем PAM-профиль для ocserv, чтобы он использовал только RADIUS для проверки паролей
-configure_ocserv_pam_auth:
-  file.managed:
-    - name: /etc/pam.d/ocserv
-    - contents: |
-        auth      required  pam_radius_auth.so
-        account   required  pam_permit.so
-    - require:
-      - pkg: install_ocserv_packages
+      - file: configure_ocserv_radius_client
 
 # Настраиваем главный конфигурационный файл ocserv
 configure_ocserv_main:
   file.managed:
     - name: /etc/ocserv/ocserv.conf
     - contents: |
-        # Авторизация через PAM (который смотрит в RADIUS)
-        auth = "pam[gid-min=1000]"
+        # Прямая авторизация через RADIUS в обход PAM
+        auth = "radius[config=/etc/radcli/radiusclient.conf]"
+        acct = "radius[config=/etc/radcli/radiusclient.conf]"
         
-        # Перевели на порт 4443, так как порт 443 занят сервером Nginx!
+        # Системные параметры Debian 12
+        socket-file = /run/ocserv.socket
+        chroot-dir = /var/lib/ocserv
+        
+        # Порты для подключения клиентов
         tcp-port = 4443
         udp-port = 4443
         
@@ -82,23 +77,40 @@ configure_ocserv_main:
     - require:
       - pkg: install_ocserv_packages
 
-# ИСПРАВИЛИ: Включаем форвардинг пакетов на уровне ядра Linux (правильный синтаксис Salt)
+# Включаем форвардинг пакетов на уровне ядра Linux
 enable_ip_forwarding:
   sysctl.present:
     - name: net.ipv4.ip_forward
     - value: 1
 
-# Перезапускаем сервисы, чтобы применить все изменения
+# Устанавливаем утилиту iptables и инструмент сохранения правил при перезагрузке
+install_iptables_packages:
+  pkg.installed:
+    - names:
+      - iptables
+      - iptables-persistent
+
+# Автоматически настраиваем маскарадинг (NAT) для трафика из подсети VPN
+enable_vpn_nat:
+  cmd.run:
+    - name: iptables -t nat -A POSTROUTING -s 192.168.10.0/24 -o $(ip route show default | awk '{print $5}') -j MASQUERADE
+    - unless: iptables -t nat -C POSTROUTING -s 192.168.10.0/24 -j MASQUERADE
+    - require:
+      - pkg: install_iptables_packages
+
+# Сохраняем правила в системный файл, чтобы они автоматически поднимались после ребута сервера
+save_iptables_rules:
+  cmd.run:
+    - name: iptables-save > /etc/iptables/rules.v4
+    - watch:
+      - cmd: enable_vpn_nat
+
+# Перезапускаем OpenConnect, если его конфиги изменились
 restart_services_ocserv:
   service.running:
     - name: ocserv
     - enable: True
     - watch:
       - file: configure_ocserv_main
-      - file: configure_ocserv_pam_auth
-
-restart_services_radius_ocserv:
-  service.running:
-    - name: freeradius
-    - watch:
-      - file: configure_freeradius_local_client
+      - file: configure_ocserv_radius_client
+      - file: configure_ocserv_radius_servers_key
