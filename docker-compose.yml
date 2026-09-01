@@ -1,0 +1,13 @@
+services:
+  salt-master:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: salt-vds:latest
+    container_name: salt-master
+    volumes:
+      - ./config/roster:/etc/salt/roster:ro
+      - ./keys:/etc/salt/keys:ro
+      - ./states:/srv/salt
+      - ./pillar:/srv/pillar
+    restart: unless-stopped

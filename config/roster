@@ -1,0 +1,9 @@
+vds-host:
+    host: 213.155.10.188
+    user: root
+    priv: /etc/salt/keys/id_rsa
+    ignore_hostkeys: True
+    ssh_options:
+      - StrictHostKeyChecking=no
+      - UserKnownHostsFile=/dev/null
+      - ConnectTimeout=10
